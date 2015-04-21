@@ -1,14 +1,16 @@
 var express = require('express')
   , app = express()
   , _ = require('underscore')
-  , authbox = require('authbox')
+  , emptyFunction = require('authbox-common/emptyFunction')
   , crypto = require('crypto')
   , exec = require('child_process').exec
   , fs = require('fs')
   , mixpanel = require('mixpanel')
   , redis = require('redis-url').connect()
+  , request = require('request')
   , spawn = require('child_process').spawn
-  , text = require('../lib/text');
+  , text = require('../lib/text')
+  , uuid = require('uuid');
 
 // Express config
 app.set('views', __dirname + '/views');
@@ -31,7 +33,8 @@ try {
 
 var mpq
   , mixpanel_config
-  , authbox_config;
+  , smyte
+  , smyte_config;
 try {
   mixpanel_config = require('./mixpanel_config.js');
   mpq = new mixpanel.Client(mixpanel_config.api_key);
@@ -40,11 +43,42 @@ try {
 }
 
 try {
-  authbox_config = require('./authbox_config.js');
-  authbox.configure(authbox_config);
-  app.use(authbox.middleware);
+  smyte_config = require('./authbox_config.js');
+  smyte = {
+    log: function(action, object, cb) {
+      cb = cb || emptyFunction.thatReturnsArgument;
+      action = action || {}
+      object = object || null;
+      var data = {
+        PUT: {},
+        POST: {},
+      };
+
+      if (object) {
+        var text_id = uuid.v4();
+        data.PUT['/object/text/' + text_id] = object;
+        action.data = {
+          text_id: text_id,
+          recipient_id: object.recipient || null
+        };
+      }
+      data.POST['/action'] = [action];
+
+      request
+        .post('https://api.smyte.com/v2/batch')
+        .auth(smyte_config.apiKey, smyte_config.secretKey)
+        .set('Content-Type', 'application/json')
+        .send(data)
+        .end(cb);
+    }
+  };
 } catch(e) {
-  authbox = {log: function() {}};
+  smyte = {
+    log: function(body, object, cb) {
+      cb = cb || emptyFunction.thatReturnsArgument;
+      cb();
+    }
+  };
 }
 
 var access_keys;
@@ -94,14 +128,18 @@ function textRequestHandler(req, res, number, region, key) {
     ip = req.header('X-Real-IP');
   }
 
-  var authbox_details = {
-    $actionName: 'text',
-    $ipAddress: ip
+  var smyte_action = {
+    name: 'text',
+    http_request: {
+      network: {
+        remote_address: ip
+      },
+    },
   };
 
   if (!number || !req.body.message) {
     mpq.track('incomplete request');
-    authbox.log(req, _.extend(authbox_details, {$failureReason: 'incomplete_request'}));
+    smyte.log(_.extend(smyte_action, {failure_code: 'incomplete_request'}));
     res.send({success:false, message:'Number and message parameters are required.'});
     return;
   }
@@ -113,17 +151,18 @@ function textRequestHandler(req, res, number, region, key) {
     message = ' ' + message;
   }
 
+  var smyte_object = {};
   var shasum = crypto.createHash('sha1');
   shasum.update(number);
-  var authbox_digest = shasum.digest('hex');
-  _.extend(authbox_details, {
-    recipient: authbox_digest,
-    message__text: message
+  var smyte_digest = shasum.digest('hex');
+  _.extend(smyte_object, {
+    recipient: smyte_digest,
+    message: message
   });
 
   if (banned_numbers.BLACKLIST[number]) {
     mpq.track('banned number');
-    authbox.log(req, _.extend(authbox_details, {$failureReason: 'banned_number'}));
+    smyte.log(_.extend(smyte_action, {failure_code: 'banned_number'}), smyte_object);
     res.send({success:false,message:'Sorry, texts to this number are disabled.'});
     return;
   }
@@ -141,7 +180,7 @@ function textRequestHandler(req, res, number, region, key) {
     text.send(number, message, region, function(err) {
       if (err) {
         mpq.track('sendText failed', tracking_details);
-        authbox.log(req, _.extend(authbox_details, {$failureReason: 'gateway_failed'}));
+        smyte.log(_.extend(smyte_action, {failure_code: 'gateway_failed'}), smyte_object);
         res.send(_.extend(response_obj,
                           {
                             success:false,
@@ -149,9 +188,17 @@ function textRequestHandler(req, res, number, region, key) {
                           }));
       }
       else {
-        mpq.track('sendText success', tracking_details);
-        authbox.log(req, _.extend(authbox_details, {$success: true}));
-        res.send(_.extend(response_obj, {success:true}));
+        smyte.log(smyte_action, smyte_object, function(response) {
+          response = response || {};
+          var actionResponse = (response.body || {}).POST || {};
+          if ((actionResponse['/action'] || {}).statusCode === 403) {
+            mpq.track('blocked by smyte', tracking_details);
+            res.send(_.extend(response_obj, {success:false, message:'Unable to send.'}));
+          } else {
+            mpq.track('sendText success', tracking_details);
+            res.send(_.extend(response_obj, {success:true}));
+          }
+        });
       }
     });
   };
@@ -188,7 +235,7 @@ function textRequestHandler(req, res, number, region, key) {
     }, 1000*60*3);
     if (num > 3) {
       mpq.track('exceeded phone quota');
-      authbox.log(req, _.extend(authbox_details, {$failureReason: 'exceeded_phone_quota'}));
+      smyte.log(_.extend(smyte_action, {failure_code: 'exceeded_phone_quota'}), smyte_object);
       res.send({success:false, message:'Exceeded quota for this phone number. ' + number});
       return;
     }
@@ -202,7 +249,7 @@ function textRequestHandler(req, res, number, region, key) {
       }
       if (num > 75) {
         mpq.track('exceeded ip quota');
-        authbox.log(req, _.extend(authbox_details, {$failureReason: 'exceeded_ip_quota'}));
+        smyte.log(_.extend(smyte_action, {failure_code: 'exceeded_ip_quota'}), smyte_object);
         res.send({success:false, message:'Exceeded quota for this IP address. ' + ip});
         return;
       }
